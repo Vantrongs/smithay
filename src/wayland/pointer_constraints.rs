@@ -17,7 +17,8 @@ use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_pointer_constraints_v1::{self, Lifetime, ZwpPointerConstraintsV1},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
+    backend::{GlobalId, ObjectId},
     protocol::wl_surface::WlSurface,
 };
 
@@ -37,14 +38,30 @@ pub trait PointerConstraintsHandler: SeatHandler {
     /// Use [`with_pointer_constraint`] to access the constraint.
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
-    /// Pointer constraint removed for `pointer` on `surface`
+    /// Pointer constraint removed for `pointer` on `surface`.
     ///
-    /// Don't use [`with_pointer_constraint`] to access the constraint
+    /// The removed constraint is no longer available through [`with_pointer_constraint`].
     fn remove_constraint(
         &mut self,
         _surface: &WlSurface,
         _pointer: &PointerHandle<Self>,
-        _constraint: Option<&PointerConstraint>,
+        _constraint: &PointerConstraint,
+    ) {
+    }
+
+    /// An active pointer constraint was deactivated for `pointer` on `surface`.
+    ///
+    /// Persistent constraints remain available through [`with_pointer_constraint`] and may be
+    /// activated again. One-shot constraints are removed after this callback returns.
+    ///
+    /// This callback can run while pointer motion is being dispatched and while the surface's
+    /// constraint state is borrowed. Implementations must defer pointer-handle operations and
+    /// calls to [`with_pointer_constraint`] until after the current dispatch completes.
+    fn constraint_deactivated(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _constraint: &PointerConstraint,
     ) {
     }
 
@@ -118,6 +135,7 @@ pub enum PointerConstraint {
 #[derive(Debug)]
 pub struct PointerConstraintRef<'a, D: SeatHandler + 'static> {
     entry: hash_map::OccupiedEntry<'a, PointerHandle<D>, PointerConstraint>,
+    surface: WlSurface,
 }
 
 impl<D: SeatHandler + 'static> ops::Deref for PointerConstraintRef<'_, D> {
@@ -154,7 +172,7 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
     ///
     /// This is sent automatically when the surface loses pointer focus, but
     /// may also be invoked while the surface is focused.
-    pub fn deactivate(self, state: &mut D, surface: &WlSurface, pointer: &PointerHandle<D>) {
+    pub fn deactivate(self, state: &mut D) {
         let deactivated = match self.entry.get() {
             PointerConstraint::Confined(confined) => {
                 if confined.active.swap(false, Ordering::SeqCst) {
@@ -175,8 +193,8 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
         };
 
         if deactivated {
-            let constraint = self.entry.get();
-            state.remove_constraint(surface, pointer, Some(constraint));
+            let pointer = self.entry.key().clone();
+            state.constraint_deactivated(&self.surface, &pointer, self.entry.get());
         }
 
         if deactivated && self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
@@ -186,6 +204,14 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
 }
 
 impl PointerConstraint {
+    /// Protocol object identifying this constraint.
+    pub fn id(&self) -> ObjectId {
+        match self {
+            PointerConstraint::Confined(confined) => confined.handle.id(),
+            PointerConstraint::Locked(locked) => locked.handle.id(),
+        }
+    }
+
     /// Constraint is active
     pub fn is_active(&self) -> bool {
         match self {
@@ -203,7 +229,8 @@ impl PointerConstraint {
         }
     }
 
-    fn lifetime(&self) -> WEnum<Lifetime> {
+    /// Whether this constraint is persistent or one-shot.
+    pub fn lifetime(&self) -> WEnum<Lifetime> {
         match self {
             PointerConstraint::Confined(confined) => confined.lifetime,
             PointerConstraint::Locked(locked) => locked.lifetime,
@@ -279,7 +306,10 @@ pub fn with_pointer_constraint<
 ) -> T {
     with_constraint_data::<D, _, _>(surface, |data| {
         let constraint = data.and_then(|data| match data.constraints.entry(pointer.clone()) {
-            hash_map::Entry::Occupied(entry) => Some(PointerConstraintRef { entry }),
+            hash_map::Entry::Occupied(entry) => Some(PointerConstraintRef {
+                entry,
+                surface: surface.clone(),
+            }),
             hash_map::Entry::Vacant(_) => None,
         });
         f(constraint)
@@ -365,20 +395,18 @@ fn remove_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     state: &mut D,
     surface: &WlSurface,
     pointer: &PointerHandle<D>,
+    constraint_id: &ObjectId,
 ) {
-    let (is_removed, constraint) = with_constraint_data::<D, _, _>(surface, |data| {
-        if let Some(data) = data {
-            if let Some(constraint) = data.constraints.remove(pointer) {
-                return (true, Some(constraint));
-            }
+    let constraint = with_constraint_data::<D, _, _>(surface, |data| {
+        let entry = data?.constraints.entry(pointer.clone());
+        match entry {
+            hash_map::Entry::Occupied(entry) if entry.get().id() == *constraint_id => Some(entry.remove()),
+            _ => None,
         }
-        (false, None)
     });
 
-    if is_removed {
-        if let Some(constraint) = constraint {
-            state.remove_constraint(surface, pointer, Some(&constraint));
-        }
+    if let Some(constraint) = constraint {
+        state.remove_constraint(surface, pointer, &constraint);
     }
 }
 
@@ -526,13 +554,13 @@ where
         &self,
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &ZwpConfinedPointerV1,
+        resource: &ZwpConfinedPointerV1,
     ) {
         let Some(pointer) = &self.pointer else {
             return;
         };
 
-        remove_constraint(state, &self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer, &resource.id());
     }
 }
 
@@ -579,12 +607,12 @@ where
         &self,
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &ZwpLockedPointerV1,
+        resource: &ZwpLockedPointerV1,
     ) {
         let Some(pointer) = &self.pointer else {
             return;
         };
 
-        remove_constraint(state, &self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer, &resource.id());
     }
 }

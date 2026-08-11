@@ -369,25 +369,8 @@ impl<BackendData: Backend> KeyboardShortcutsInhibitHandler for AnvilState<Backen
     }
 }
 
-impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData> {
-    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        // XXX region
-        let Some(current_focus) = pointer.current_focus() else {
-            return;
-        };
-        if current_focus.wl_surface().as_deref() == Some(surface) {
-            with_pointer_constraint(surface, pointer, |constraint| {
-                constraint.unwrap().activate();
-            });
-        }
-    }
-
-    fn remove_constraint(
-        &mut self,
-        _surface: &WlSurface,
-        pointer: &PointerHandle<Self>,
-        _constraint: Option<&PointerConstraint>,
-    ) {
+impl<BackendData: Backend> AnvilState<BackendData> {
+    fn apply_pointer_constraint_hint(&mut self, pointer: &PointerHandle<Self>) {
         let Some((hint_surface, hint_location)) = self.cursor_position_hint.take() else {
             return;
         };
@@ -413,6 +396,42 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
             .to_f64();
 
         pointer.set_location(origin + hint_location);
+    }
+}
+
+impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData> {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // XXX region
+        let Some(current_focus) = pointer.current_focus() else {
+            return;
+        };
+        if current_focus.wl_surface().as_deref() == Some(surface) {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                constraint.unwrap().activate();
+            });
+        }
+    }
+
+    fn remove_constraint(
+        &mut self,
+        _surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        constraint: &PointerConstraint,
+    ) {
+        // An inactive persistent constraint already emitted `constraint_deactivated`, so applying
+        // its hint again here could consume another active constraint's hint.
+        if constraint.is_active() {
+            self.apply_pointer_constraint_hint(pointer);
+        }
+    }
+
+    fn constraint_deactivated(
+        &mut self,
+        _surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        _constraint: &PointerConstraint,
+    ) {
+        self.apply_pointer_constraint_hint(pointer);
     }
 
     fn cursor_position_hint(
