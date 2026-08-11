@@ -40,11 +40,11 @@ use smithay::{
         },
         wayland_server::{
             Client, Display, DisplayHandle, Resource,
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time},
+    utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Time},
     wayland::{
         commit_timing::{CommitTimerBarrierStateUserData, CommitTimingManagerState},
         compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent, with_states},
@@ -175,7 +175,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub seat: Seat<AnvilState<BackendData>>,
     pub clock: Clock<Monotonic>,
     pub pointer: PointerHandle<AnvilState<BackendData>>,
-    pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
+    pub pending_pointer_constraint_warps: HashMap<PointerHandle<AnvilState<BackendData>>, ObjectId>,
 
     #[cfg(feature = "xwayland")]
     pub xwm: Option<X11Wm>,
@@ -369,6 +369,55 @@ impl<BackendData: Backend> KeyboardShortcutsInhibitHandler for AnvilState<Backen
     }
 }
 
+impl<BackendData: Backend> AnvilState<BackendData> {
+    fn apply_pointer_constraint_hint_later(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        constraint: &PointerConstraint,
+    ) {
+        let constraint_id = constraint.id();
+        let PointerConstraint::Locked(locked) = constraint else {
+            self.pending_pointer_constraint_warps.remove(pointer);
+            return;
+        };
+        let Some(hint_location) = locked.cursor_position_hint() else {
+            self.pending_pointer_constraint_warps.remove(pointer);
+            return;
+        };
+
+        self.pending_pointer_constraint_warps
+            .insert(pointer.clone(), constraint_id.clone());
+        let hint_surface = surface.clone();
+        let pointer = pointer.clone();
+        self.handle.insert_idle(move |state| {
+            let is_current = state
+                .pending_pointer_constraint_warps
+                .get(&pointer)
+                .is_some_and(|pending_id| pending_id == &constraint_id);
+            if !is_current {
+                return;
+            }
+            state.pending_pointer_constraint_warps.remove(&pointer);
+            if !hint_surface.alive() {
+                return;
+            }
+
+            let origin = state
+                .space
+                .elements()
+                .find_map(|window| {
+                    (window.wl_surface().as_deref() == Some(&hint_surface)).then(|| window.geometry())
+                })
+                .unwrap_or_default()
+                .loc
+                .to_f64();
+
+            pointer.set_location(origin + hint_location);
+        });
+    }
+}
+
 impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData> {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // XXX region
@@ -376,45 +425,37 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
             return;
         };
         if current_focus.wl_surface().as_deref() == Some(surface) {
+            let mut activated = false;
             with_pointer_constraint(surface, pointer, |constraint| {
                 constraint.unwrap().activate();
+                activated = true;
             });
+            if activated {
+                self.pending_pointer_constraint_warps.remove(pointer);
+            }
         }
     }
 
     fn remove_constraint(
         &mut self,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         pointer: &PointerHandle<Self>,
-        _constraint: Option<&PointerConstraint>,
+        constraint: &PointerConstraint,
     ) {
-        if let Some((hint_surface, hint_location)) = &self.cursor_position_hint {
-            let origin = self
-                .space
-                .elements()
-                .find_map(|window| {
-                    (window.wl_surface().as_deref() == Some(hint_surface)).then(|| window.geometry())
-                })
-                .unwrap_or_default()
-                .loc
-                .to_f64();
-
-            pointer.set_location(origin + *hint_location);
+        // An inactive persistent constraint already emitted `constraint_deactivated`, so applying
+        // its hint again here would move the pointer twice.
+        if constraint.is_active() {
+            self.apply_pointer_constraint_hint_later(surface, pointer, constraint);
         }
-        self.cursor_position_hint = None;
     }
 
-    fn cursor_position_hint(
+    fn constraint_deactivated(
         &mut self,
         surface: &WlSurface,
         pointer: &PointerHandle<Self>,
-        location: Point<f64, Logical>,
+        constraint: &PointerConstraint,
     ) {
-        if with_pointer_constraint(surface, pointer, |constraint| {
-            constraint.is_some_and(|c| c.is_active())
-        }) {
-            self.cursor_position_hint = Some((surface.clone(), location));
-        }
+        self.apply_pointer_constraint_hint_later(surface, pointer, constraint);
     }
 }
 
@@ -767,7 +808,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             seat_name,
             seat,
             pointer,
-            cursor_position_hint: None,
+            pending_pointer_constraint_warps: HashMap::new(),
             clock,
 
             #[cfg(feature = "xwayland")]

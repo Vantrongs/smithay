@@ -987,15 +987,20 @@ impl AnvilState<UdevData> {
         if let Some((under, surface_location)) =
             new_under.and_then(|(target, loc)| Some((target.wl_surface()?.into_owned(), loc)))
         {
+            let mut activated = false;
             with_pointer_constraint(&under, &pointer, |constraint| match constraint {
                 Some(constraint) if !constraint.is_active() => {
                     let point = (pointer_location - surface_location).to_i32_round();
                     if constraint.region().is_none_or(|region| region.contains(point)) {
                         constraint.activate();
+                        activated = true;
                     }
                 }
                 _ => {}
             });
+            if activated {
+                self.pending_pointer_constraint_warps.remove(&pointer);
+            }
         }
     }
 

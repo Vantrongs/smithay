@@ -255,7 +255,7 @@ where
 
             with_pointer_constraint(self, &pointer, |constraint| {
                 if let Some(constraint) = constraint {
-                    constraint.deactivate(data, self, &pointer);
+                    constraint.deactivate(data);
                 }
             });
         }
