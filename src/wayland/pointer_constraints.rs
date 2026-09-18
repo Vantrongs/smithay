@@ -17,7 +17,8 @@ use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_pointer_constraints_v1::{self, Lifetime, ZwpPointerConstraintsV1},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::{GlobalId, ObjectId},
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
+    backend::{GlobalId, ObjectId},
     protocol::wl_surface::WlSurface,
 };
 
@@ -54,6 +55,19 @@ pub trait PointerConstraintsHandler: SeatHandler {
         _surface: &WlSurface,
         _pointer: &PointerHandle<Self>,
         _constraint_remove: ConstraintRemove,
+    ) {
+    }
+
+    /// An active constraint was deactivated through `deactivate_with_state`.
+    ///
+    /// The surface constraint map is borrowed during this callback. Defer pointer-handle
+    /// operations and calls to `with_pointer_constraint` until dispatch has completed.
+    /// One-shot constraints are removed after this callback; persistent ones remain registered.
+    fn constraint_deactivated(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _constraint: &PointerConstraint,
     ) {
     }
 
@@ -127,6 +141,7 @@ pub enum PointerConstraint {
 #[derive(Debug)]
 pub struct PointerConstraintRef<'a, D: SeatHandler + 'static> {
     entry: hash_map::OccupiedEntry<'a, PointerHandle<D>, PointerConstraint>,
+    surface: WlSurface,
 }
 
 impl<D: SeatHandler + 'static> ops::Deref for PointerConstraintRef<'_, D> {
@@ -164,6 +179,21 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
     /// This is sent automatically when the surface loses pointer focus, but
     /// may also be invoked while the surface is focused.
     pub fn deactivate(self) {
+        self.deactivate_with(|_| {});
+    }
+
+    /// Deactivate the constraint and notify `PointerConstraintsHandler::constraint_deactivated`.
+    ///
+    /// Unlike `deactivate`, this preserves the terminal one-shot state for the callback.
+    /// Automatic pointer-focus leaves use this method before reporting `ConstraintRemove::PointerLeave`.
+    pub fn deactivate_with_state(self, state: &mut D) {
+        self.deactivate_with(|constraint| {
+            let pointer = constraint.entry.key().clone();
+            state.constraint_deactivated(&constraint.surface, &pointer, constraint.entry.get());
+        });
+    }
+
+    fn deactivate_with(self, notify: impl FnOnce(&Self)) {
         let deactivated = match self.entry.get() {
             PointerConstraint::Confined(confined) => {
                 if confined.active.swap(false, Ordering::SeqCst) {
@@ -183,6 +213,9 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
             }
         };
 
+        if deactivated {
+            notify(&self);
+        }
         if deactivated && self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
             self.entry.remove_entry();
         }
@@ -215,7 +248,8 @@ impl PointerConstraint {
         }
     }
 
-    fn lifetime(&self) -> WEnum<Lifetime> {
+    /// Whether the protocol object is persistent or one-shot.
+    pub fn lifetime(&self) -> WEnum<Lifetime> {
         match self {
             PointerConstraint::Confined(confined) => confined.lifetime,
             PointerConstraint::Locked(locked) => locked.lifetime,
@@ -291,7 +325,10 @@ pub fn with_pointer_constraint<
 ) -> T {
     with_constraint_data::<D, _, _>(surface, |data| {
         let constraint = data.and_then(|data| match data.constraints.entry(pointer.clone()) {
-            hash_map::Entry::Occupied(entry) => Some(PointerConstraintRef { entry }),
+            hash_map::Entry::Occupied(entry) => Some(PointerConstraintRef {
+                entry,
+                surface: surface.clone(),
+            }),
             hash_map::Entry::Vacant(_) => None,
         });
         f(constraint)
@@ -571,7 +608,8 @@ where
                 with_pointer_constraint(&self.surface, pointer, |constraint| {
                     if let Some(PointerConstraint::Locked(locked)) = constraint
                         .filter(|x| x.id() == locked_pointer.id())
-                        .map(|x| x.entry.into_mut()) {
+                        .map(|x| x.entry.into_mut())
+                    {
                         locked.pending_cursor_position_hint = Some((surface_x, surface_y).into());
                     }
                 });
@@ -580,7 +618,8 @@ where
                 with_pointer_constraint(&self.surface, pointer, |constraint| {
                     if let Some(PointerConstraint::Locked(locked)) = constraint
                         .filter(|x| x.id() == locked_pointer.id())
-                        .map(|x| x.entry.into_mut()) {
+                        .map(|x| x.entry.into_mut())
+                    {
                         locked.pending_region = region.as_ref().map(compositor::get_region_attributes);
                     }
                 });

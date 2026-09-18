@@ -281,7 +281,7 @@ where
                 if let Some(constraint) = constraint {
                     if constraint.is_active() {
                         let region = constraint.region().cloned();
-                        constraint.deactivate();
+                        constraint.deactivate_with_state(data);
                         Some(region)
                     } else {
                         None
