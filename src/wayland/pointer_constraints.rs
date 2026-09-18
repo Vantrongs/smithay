@@ -17,7 +17,7 @@ use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_pointer_constraints_v1::{self, Lifetime, ZwpPointerConstraintsV1},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::{GlobalId, ObjectId},
     protocol::wl_surface::WlSurface,
 };
 
@@ -190,6 +190,14 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
 }
 
 impl PointerConstraint {
+    /// Protocol object identifying this constraint.
+    pub fn id(&self) -> ObjectId {
+        match self {
+            PointerConstraint::Confined(confined) => confined.handle.id(),
+            PointerConstraint::Locked(locked) => locked.handle.id(),
+        }
+    }
+
     /// Constraint is active
     pub fn is_active(&self) -> bool {
         match self {
@@ -369,17 +377,17 @@ fn remove_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     state: &mut D,
     surface: &WlSurface,
     pointer: &PointerHandle<D>,
+    constraint_id: &ObjectId,
 ) {
-    let is_removed = with_constraint_data::<D, _, _>(surface, |data| {
-        if let Some(data) = data {
-            if let Some(constraint) = data.constraints.remove(pointer) {
-                return Some(constraint);
-            }
+    let removed = with_constraint_data::<D, _, _>(surface, |data| {
+        let entry = data?.constraints.entry(pointer.clone());
+        match entry {
+            hash_map::Entry::Occupied(entry) if entry.get().id() == *constraint_id => Some(entry.remove()),
+            _ => None,
         }
-        None
     });
 
-    if let Some(constraint) = is_removed {
+    if let Some(constraint) = removed {
         state.remove_constraint(surface, pointer, ConstraintRemove::Destroyed(constraint));
     }
 }
@@ -500,7 +508,7 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _confined_pointer: &ZwpConfinedPointerV1,
+        confined_pointer: &ZwpConfinedPointerV1,
         request: zwp_confined_pointer_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
@@ -512,8 +520,9 @@ where
         match request {
             zwp_confined_pointer_v1::Request::SetRegion { region } => {
                 with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Confined(confined)) =
-                        constraint.map(|x| x.entry.into_mut())
+                    if let Some(PointerConstraint::Confined(confined)) = constraint
+                        .filter(|x| x.id() == confined_pointer.id())
+                        .map(|x| x.entry.into_mut())
                     {
                         confined.pending_region = region.as_ref().map(compositor::get_region_attributes);
                     }
@@ -528,13 +537,13 @@ where
         &self,
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &ZwpConfinedPointerV1,
+        resource: &ZwpConfinedPointerV1,
     ) {
         let Some(pointer) = &self.pointer else {
             return;
         };
 
-        remove_constraint(state, &self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer, &resource.id());
     }
 }
 
@@ -548,7 +557,7 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _locked_pointer: &ZwpLockedPointerV1,
+        locked_pointer: &ZwpLockedPointerV1,
         request: zwp_locked_pointer_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
@@ -560,14 +569,18 @@ where
         match request {
             zwp_locked_pointer_v1::Request::SetCursorPositionHint { surface_x, surface_y } => {
                 with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
+                    if let Some(PointerConstraint::Locked(locked)) = constraint
+                        .filter(|x| x.id() == locked_pointer.id())
+                        .map(|x| x.entry.into_mut()) {
                         locked.pending_cursor_position_hint = Some((surface_x, surface_y).into());
                     }
                 });
             }
             zwp_locked_pointer_v1::Request::SetRegion { region } => {
                 with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
+                    if let Some(PointerConstraint::Locked(locked)) = constraint
+                        .filter(|x| x.id() == locked_pointer.id())
+                        .map(|x| x.entry.into_mut()) {
                         locked.pending_region = region.as_ref().map(compositor::get_region_attributes);
                     }
                 });
@@ -581,12 +594,12 @@ where
         &self,
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &ZwpLockedPointerV1,
+        resource: &ZwpLockedPointerV1,
     ) {
         let Some(pointer) = &self.pointer else {
             return;
         };
 
-        remove_constraint(state, &self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer, &resource.id());
     }
 }
